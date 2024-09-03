@@ -138,9 +138,9 @@ void USpudSubsystem::QuickSaveGame(FText Title, bool bTakeScreenshot, const USpu
 		ExtraInfo);
 }
 
-void USpudSubsystem::QuickLoadGame()
+void USpudSubsystem::QuickLoadGame(const FString& TravelOptions)
 {
-	LoadGame(SPUD_QUICKSAVE_SLOTNAME);
+	LoadGame(SPUD_QUICKSAVE_SLOTNAME, TravelOptions);
 }
 
 
@@ -164,11 +164,11 @@ void USpudSubsystem::NotifyLevelUnloadedExternally(ULevel* Level)
 	HandleLevelUnloaded(Level);
 }
 
-void USpudSubsystem::LoadLatestSaveGame()
+void USpudSubsystem::LoadLatestSaveGame(const FString& TravelOptions)
 {
 	auto Latest = GetLatestSaveGame();
 	if (Latest)
-		LoadGame(Latest->SlotName);
+		LoadGame(Latest->SlotName, TravelOptions);
 }
 
 void USpudSubsystem::OnPreLoadMap(const FString& MapName)
@@ -504,7 +504,7 @@ void USpudSubsystem::StoreLevel(ULevel* Level, bool bRelease, bool bBlocking)
 	PostLevelStore.Broadcast(LevelName, true);
 }
 
-void USpudSubsystem::LoadGame(const FString& SlotName)
+void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOptions)
 {
 	if (!ServerCheck(true))
 	{
@@ -570,8 +570,9 @@ void USpudSubsystem::LoadGame(const FString& SlotName)
 
 	// This is deferred, final load process will happen in PostLoadMap
 	SlotNameInProgress = SlotName;
-	UE_LOG(LogSpudSubsystem, Verbose, TEXT("(Re)loading map: %s"), *State->GetPersistentLevel());		
-	UGameplayStatics::OpenLevel(GetWorld(), FName(State->GetPersistentLevel()));
+	UE_LOG(LogSpudSubsystem, Verbose, TEXT("(Re)loading map: %s"), *State->GetPersistentLevel());
+	
+	UGameplayStatics::OpenLevel(GetWorld(), FName(State->GetPersistentLevel()), true, TravelOptions);
 }
 
 
@@ -1007,14 +1008,14 @@ USpudSaveGameInfo* USpudSubsystem::GetSaveGameInfo(const FString& SlotName)
 		UE_LOG(LogSpudSubsystem, Error, TEXT("Unable to open %s for reading info"), *AbsoluteFilename);
 		return nullptr;
 	}
-		
+
 	auto Info = NewObject<USpudSaveGameInfo>();
 	Info->SlotName = SlotName;
 
-	USpudState::LoadSaveInfoFromArchive(*Archive, *Info);
+	const bool bResult = USpudState::LoadSaveInfoFromArchive(*Archive, *Info);
 	Archive->Close();
-		
-	return Info;
+
+	return bResult ? Info : nullptr;
 }
 
 USpudSaveGameInfo* USpudSubsystem::GetLatestSaveGame()

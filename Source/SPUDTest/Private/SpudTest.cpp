@@ -1,7 +1,8 @@
 ﻿#include "Misc/AutomationTest.h"
-#include "Engine.h"
 #include "SpudState.h"
 #include "TestSaveObject.h"
+#include "Engine/PointLight.h"
+#include "Engine/StaticMeshActor.h"
 
 
 template<typename T>
@@ -169,7 +170,7 @@ void CheckAllTypes(FAutomationTestBase* Test, const FString& Prefix, const T& Ac
 	Test->TestEqual(Prefix + "StringVal should match", Actual.StringVal, Expected.StringVal);
 	Test->TestEqual(Prefix + "TextVal should match", Actual.TextVal.ToString(), Expected.TextVal.ToString());
 
-	Test->TestNotNull(Prefix + "UObject shouldn't be null", Actual.UObjectVal);
+	Test->TestNotNull(Prefix + "UObject shouldn't be null", Actual.UObjectVal.Get());
 	if (Actual.UObjectVal)
 	{
 		Test->TestEqual(Prefix + "UObject String should match", Actual.UObjectVal->NestedStringVal, Expected.UObjectVal->NestedStringVal);
@@ -305,6 +306,7 @@ bool FTestStructs::RunTest(const FString& Parameters)
 
 	PopulateAllTypes(SavedObj->SimpleStruct);
 	PopulateAllTypes(SavedObj->NestedStruct.Nested);
+	PopulateAllTypes(SavedObj->InstancedStruct.GetMutable<FTestAllTypesStruct>());
 
 	auto State = NewObject<USpudState>();
 	State->StoreGlobalObject(SavedObj, "StructTest");
@@ -314,6 +316,8 @@ bool FTestStructs::RunTest(const FString& Parameters)
 
 	CheckAllTypes(this, "SimpleStruct|", LoadedObj->SimpleStruct, SavedObj->SimpleStruct);
 	CheckAllTypes(this, "NestedStruct|", LoadedObj->NestedStruct.Nested, SavedObj->NestedStruct.Nested);
+	CheckAllTypes(this, "InstancedStruct|", LoadedObj->InstancedStruct.GetMutable<FTestAllTypesStruct>(),
+		SavedObj->InstancedStruct.GetMutable<FTestAllTypesStruct>());
 
 	return true;
 }
@@ -377,11 +381,11 @@ bool FTestNestedObject::RunTest(const FString& Parameters)
 	auto LoadedObj = NewObject<UTestSaveObjectParent>();
 	State->RestoreGlobalObject(LoadedObj, "TestObject");
 
-	TestNotNull("UObject1 shouldn't be null", LoadedObj->UObjectVal1);
-	TestNotNull("UObject2 shouldn't be null", LoadedObj->UObjectVal2);
-	TestNotNull("UObject3 shouldn't be null", LoadedObj->UObjectVal3);
-	TestNotNull("UObject4 shouldn't be null", LoadedObj->UObjectVal4);
-	TestNotNull("UObject5 shouldn't be null", LoadedObj->UObjectVal5);
+	TestNotNull("UObject1 shouldn't be null", LoadedObj->UObjectVal1.Get());
+	TestNotNull("UObject2 shouldn't be null", LoadedObj->UObjectVal2.Get());
+	TestNotNull("UObject3 shouldn't be null", LoadedObj->UObjectVal3.Get());
+	TestNotNull("UObject4 shouldn't be null", LoadedObj->UObjectVal4.Get());
+	TestNotNull("UObject5 shouldn't be null", LoadedObj->UObjectVal5.Get());
 
 	return true;
 }
