@@ -7,6 +7,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
 #include "Engine/World.h"
+#include "Engine/AssetUserData.h"
 
 #include "SpudSubsystem.generated.h"
 
@@ -32,6 +33,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSpudPostUnloadStreamingLevel, const
 
 // Callbacks passed to functions
 DECLARE_DYNAMIC_DELEGATE_RetVal_OneParam(bool, FSpudUpgradeSaveDelegate, class USpudState*, SaveState);
+
+
 
 UENUM(BlueprintType)
 enum class ESpudSystemState : uint8
@@ -75,6 +78,7 @@ public:
 	UFUNCTION()
 	void OnLevelHidden();
 };
+
 
 /// Subsystem which controls our save games, and also the active game's persistent state (for streaming levels)
 UCLASS(Config=Engine)

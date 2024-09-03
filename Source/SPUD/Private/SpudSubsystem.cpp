@@ -8,6 +8,7 @@
 #include "TimerManager.h"
 #include "HAL/FileManager.h"
 #include "Async/Async.h"
+#include "SpudLevelDataComponent.h"
 
 DEFINE_LOG_CATEGORY(LogSpudSubsystem)
 
@@ -486,6 +487,18 @@ void USpudSubsystem::StoreWorld(UWorld* World, bool bReleaseLevels, bool bBlocki
 void USpudSubsystem::StoreLevel(ULevel* Level, bool bRelease, bool bBlocking)
 {
 	const FString LevelName = USpudState::GetLevelName(Level);
+
+	/* Modification, Gumlin Games -- expand logic for e.g. level instances, without needing a new AWorldSettings. */
+	if (AWorldSettings* settings = GetWorld()->GetWorldSettings())
+	{
+		if (USpudLevelDataComponent* data = settings->GetComponentByClass<USpudLevelDataComponent>())
+		{
+			if (Level->IsInstancedLevel() && (data->bPersistInstances == false))
+				return;
+		}
+	}
+	/* End modification. */
+
 	PreLevelStore.Broadcast(LevelName);
 	GetActiveState()->StoreLevel(Level, bRelease, bBlocking);
 	PostLevelStore.Broadcast(LevelName, true);
@@ -1264,6 +1277,19 @@ void USpudStreamingLevelWrapper::OnLevelShown()
 	const auto level = LevelStreaming->GetLoadedLevel();
 	if (level)
 	{
+		const FString LevelName = USpudState::GetLevelName(level);
+
+		/* Modification, Gumlin Games -- expand logic for e.g. level instances, without needing a new AWorldSettings. */
+		if (AWorldSettings* settings = GetWorld()->GetWorldSettings())
+		{
+			if (USpudLevelDataComponent* data = settings->GetComponentByClass<USpudLevelDataComponent>())
+			{
+				if (level->IsInstancedLevel() && (data->bPersistInstances == false))
+					return;
+			}
+		}
+		/* End modification. */
+
 		UE_LOG(LogSpudSubsystem, Verbose, TEXT("Level shown: %s"), *USpudState::GetLevelName(level));
 		
 		auto spud = UGameInstance::GetSubsystem<USpudSubsystem>(GetWorld()->GetGameInstance());
