@@ -493,7 +493,7 @@ void USpudSubsystem::StoreLevel(ULevel* Level, bool bRelease, bool bBlocking)
 	{
 		if (USpudLevelDataComponent* data = settings->GetComponentByClass<USpudLevelDataComponent>())
 		{
-			if (Level->IsInstancedLevel() && (data->bPersistInstances == false))
+			if ((Level->IsPersistentLevel() == false) && Level->IsInstancedLevel() && (data->bPersistInstances == false))
 				return;
 		}
 	}
