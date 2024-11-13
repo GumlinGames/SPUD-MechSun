@@ -459,18 +459,21 @@ void USpudSubsystem::HandleLevelLoaded(FName LevelName)
 
 void USpudSubsystem::HandleLevelUnloaded(ULevel* Level)
 {
-	UnsubscribeLevelObjectEvents(Level);
-
-	if (CurrentState != ESpudSystemState::LoadingGame && !bIsTearingDown)
+	if (ShouldStoreLevel(Level))
 	{
-		// NOTE: even though we're attempting to NOT do this while tearing down, in PIE it will still happen on end play
-		// This is because for some reason, in PIE the GameInstance shutdown function is called AFTER the levels are flushed,
-		// compared to before in normal game shutdown. See the difference between UEditorEngine::EndPlayMap() and UGameEngine::PreExit()
-		// We can't really fix this; we could listen on FEditorDelegates::PrePIEEnded but that would require linking the editor module (bleh) 
-		// save the state
-		// when loading game we will unload the current level and streaming and don't want to restore the active state from that
-		// After storing, the level data is released so doesn't take up memory any more
-		StoreLevel(Level, true, false);
+		UnsubscribeLevelObjectEvents(Level);
+
+		if (CurrentState != ESpudSystemState::LoadingGame && !bIsTearingDown)
+		{
+			// NOTE: even though we're attempting to NOT do this while tearing down, in PIE it will still happen on end play
+			// This is because for some reason, in PIE the GameInstance shutdown function is called AFTER the levels are flushed,
+			// compared to before in normal game shutdown. See the difference between UEditorEngine::EndPlayMap() and UGameEngine::PreExit()
+			// We can't really fix this; we could listen on FEditorDelegates::PrePIEEnded but that would require linking the editor module (bleh) 
+			// save the state
+			// when loading game we will unload the current level and streaming and don't want to restore the active state from that
+			// After storing, the level data is released so doesn't take up memory any more
+			StoreLevel(Level, true, false);
+		}
 	}
 }
 
@@ -480,7 +483,10 @@ void USpudSubsystem::StoreWorld(UWorld* World, bool bReleaseLevels, bool bBlocki
 {
 	for (auto && Level : World->GetLevels())
 	{
-		StoreLevel(Level, bReleaseLevels, bBlocking);
+		if (ShouldStoreLevel(Level))
+		{
+			StoreLevel(Level, bReleaseLevels, bBlocking);
+		}
 	}	
 }
 
@@ -555,6 +561,31 @@ void USpudSubsystem::LoadGame(const FString& SlotName, const FString& TravelOpti
 		return;
 	}
 
+    // The world package gets loaded way before we end up loading the world
+    // this cause an issue with the world being garbage collected from the package before we load, thus the load failing
+    // Manually loading the package here and keeping a ref to the world to prevent GC
+    // It's ugly, but only solution I could find.
+    // Related UDN posts:
+    //      https://udn.unrealengine.com/s/question/0D54z00007NVjVPCA1/async-loading-of-a-persistent-level-before-openlevel
+    //      https://udn.unrealengine.com/s/question/0D5QP000002ZPnb0AG/streamablemanager%E3%82%92%E5%88%A9%E7%94%A8%E3%81%97%E3%81%9F%E9%9D%9E%E5%90%8C%E6%9C%9F%E8%AA%AD%E3%81%BF%E8%BE%BC%E3%81%BF%E4%B8%AD%E3%81%AB%E5%AE%9F%E8%A1%8C%E3%81%97%E3%81%9Fopenlevel%E3%81%A7%E3%83%87%E3%83%95%E3%82%A9%E3%83%AB%E3%83%88%E3%83%AC%E3%83%99%E3%83%AB%E3%81%B8%E9%81%B7%E7%A7%BB%E3%81%97%E3%81%A6%E3%81%97%E3%81%BE%E3%81%86
+	{
+        const FString LevelName = State->GetPersistentLevel();
+	    // See if the level is already in memory
+	    UPackage* WorldPackage = FindPackage(nullptr, *LevelName);
+
+	    // If the level isn't already in memory, load level from disk
+	    if (WorldPackage == nullptr)
+	    {
+	        WorldPackage = LoadPackage(nullptr, *LevelName, LOAD_None);
+	    }
+
+	    if (WorldPackage != nullptr)
+	    {
+	        // Find the newly loaded world, and keep a reference to it to prevent GC
+	        WorldToLoad = UWorld::FindWorldInPackage(WorldPackage);
+	    }
+	}
+	
 	// Just do the reverse of what we did
 	// Global objects first before map, these should be only objects which survive map load
 	for (auto Ptr : GlobalObjects)
@@ -582,6 +613,8 @@ void USpudSubsystem::LoadComplete(const FString& SlotName, bool bSuccess)
 	IsRestoringState = false;
 	SlotNameInProgress = "";
 	PostLoadGame.Broadcast(SlotName, bSuccess);
+	
+	WorldToLoad = nullptr;
 }
 
 bool USpudSubsystem::DeleteSave(const FString& SlotName)
@@ -781,6 +814,11 @@ void USpudSubsystem::PostLoadStreamLevelGameThread(FName LevelName)
 			return;
 		}
 
+		if (!ShouldStoreLevel(Level))
+		{
+			return;
+		}
+
 		IsRestoringState = true;
 
 		PreLevelRestore.Broadcast(LevelName.ToString());
@@ -872,6 +910,26 @@ void USpudSubsystem::PostUnloadStreamLevelGameThread(FName LevelName)
 	PostUnloadStreamingLevel.Broadcast(LevelName);
 }
 
+bool USpudSubsystem::ShouldStoreLevel(const ULevel* Level)
+{
+	if (!Level)
+		return false;
+	
+	for (auto Pattern : ExcludeLevelNamePatterns)
+	{
+		if (USpudState::GetLevelName(Level).MatchesWildcard(Pattern))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+void USpudSubsystem::StoreActorByCell(AActor* Actor, const FString& CellName)
+{
+	GetActiveState()->StoreActor(Actor, CellName);
+}
+
 void USpudSubsystem::SubscribeAllLevelObjectEvents()
 {
 	const auto World = GetWorld();
@@ -879,7 +937,10 @@ void USpudSubsystem::SubscribeAllLevelObjectEvents()
 	{
 		for (ULevel* Level : World->GetLevels())
 		{
-			SubscribeLevelObjectEvents(Level);			
+			if (ShouldStoreLevel(Level))
+			{
+				SubscribeLevelObjectEvents(Level);
+			}
 		}
 	}
 }
@@ -891,7 +952,10 @@ void USpudSubsystem::UnsubscribeAllLevelObjectEvents()
 	{
 		for (ULevel* Level : World->GetLevels())
 		{
-			UnsubscribeLevelObjectEvents(Level);			
+			if (ShouldStoreLevel(Level))
+			{
+				UnsubscribeLevelObjectEvents(Level);
+			}
 		}
 	}
 }
@@ -1240,13 +1304,15 @@ void USpudSubsystem::Tick(float DeltaTime)
 			// Discard unloaded levels.
 			for (auto it = MonitoredStreamingLevels.CreateIterator(); it; ++it)
 			{
-				if (!streamingLevels.Contains(it.Key()))
+				if (const auto Level = it.Key(); !streamingLevels.Contains(Level))
 				{
-					UE_LOG(LogSpudSubsystem, Verbose, TEXT("Unloaded streaming level: %s"), *GetNameSafe(it.Key()));
-					check(!it.Key()->IsLevelVisible());
-					it.Key()->OnLevelShown.RemoveAll(it.Value());
-					it.Key()->OnLevelHidden.RemoveAll(it.Value());
+					UE_LOG(LogSpudSubsystem, Verbose, TEXT("Unloaded streaming level: %s"), *GetNameSafe(Level));
+					check(!Level->IsLevelVisible());
+					Level->OnLevelShown.RemoveAll(it.Value());
+					Level->OnLevelHidden.RemoveAll(it.Value());
 					it.RemoveCurrent();
+
+					PostUnloadStreamingLevel.Broadcast(FName(USpudState::GetLevelName(Level->GetWorldAssetPackageName())));
 				}
 			}
 		}
