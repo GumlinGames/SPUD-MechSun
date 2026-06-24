@@ -1,5 +1,6 @@
 using UnrealBuildTool;
 using System.IO;
+// ReSharper disable ConditionIsAlwaysTrueOrFalse
 
 public class SPUD : ModuleRules
 {
@@ -7,7 +8,7 @@ public class SPUD : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-        PublicIncludePaths.AddRange(
+		PublicIncludePaths.AddRange(
             new string[] {
             }
             );
@@ -31,7 +32,7 @@ public class SPUD : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"StructUtils"
+				"StructUtils",
 			}
 			);
 		

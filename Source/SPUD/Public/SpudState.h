@@ -23,19 +23,19 @@ class SPUD_API USpudSaveGameInfo : public UObject
 	GENERATED_BODY()
 	public:
 	/// Top-line title string. Might include the name of the region, current quest etc
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	FText Title;
 	/// Timestamp of when this save was created
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	FDateTime Timestamp;
 	/// The name of the save game slot this refers to
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	FString SlotName;
 	/// Thumbnail screenshot (may be blank if one wasn't included in the save game)
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	TObjectPtr<UTexture2D> Thumbnail;
 	/// Custom fields that you chose to store with the save header information specifically for your game
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	TObjectPtr<USpudCustomSaveInfo> CustomInfo;
 
 };
@@ -122,9 +122,7 @@ protected:
 	void StoreGlobalObject(UObject* Obj, FSpudNamedObjectData* Data);
 	void StoreObjectProperties(UObject* Obj, FSpudPropertyData& Properties, FSpudClassMetadata& Meta, int StartDepth = 0);
 	void StoreObjectProperties(UObject* Obj, uint32 PrefixID, TArray<uint32>& PropertyOffsets, FSpudClassMetadata& Meta, FSpudMemoryWriter& Out, int StartDepth = 0);
-
-	// Actually restores the world, on the assumption that it's already loaded into the correct map
-	void RestoreLoadedWorld(UWorld* World, bool bSingleLevel, const FString& OnlyLevelName = "");
+	
 	// Returns whether this is an actor which is not technically in a level, but is auto-created so doesn't need to be
 	// spawned by the restore process. E.g. GameMode, Pawns
 	bool ShouldRespawnRuntimeActor(const AActor* Actor) const;
@@ -135,27 +133,31 @@ protected:
 	AActor* RespawnActor(const FSpudSpawnedActorData& SpawnedActor, const FSpudClassMetadata& Meta, ULevel* Level);
 	void DestroyActor(const FSpudDestroyedLevelActor& DestroyedActor, ULevel* Level);
 	void RestoreCoreActorData(AActor* Actor, const FSpudCoreActorData& FromData);
-	void RestoreObjectProperties(UObject* Obj, const FSpudPropertyData& FromData, const FSpudClassMetadata& Meta,
+	void RestoreObjectProperties(UObject* Obj, const FSpudPropertyData& FromData, const FSpudClassMetadata& Meta, TSharedPtr<const FSpudClassDef> StoredClassDef,
 	                             const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth = 0);
-	void RestoreObjectProperties(UObject* Obj, FSpudMemoryReader& In, const FSpudClassMetadata& Meta, const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth = 0);
-	void RestoreObjectPropertiesFast(UObject* Obj, FSpudMemoryReader& In,
-	                                 const FSpudClassMetadata& Meta, TSharedPtr<const FSpudClassDef> ClassDef,
+	void RestoreObjectProperties(UObject* Obj, FSpudMemoryReader& In, const FSpudClassMetadata& Meta,
+								 TSharedPtr<const FSpudClassDef> StoredClassDef, const TArray<uint32>& PropertyOffsets,
+								 const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth = 0);
+	void RestoreObjectPropertiesFast(UObject* Obj, FSpudMemoryReader& In, const FSpudClassMetadata& Meta,
+	                                 TSharedPtr<const FSpudClassDef> ClassDef, const TArray<uint32>& PropertyOffsets,
 	                                 const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth = 0);
-	void RestoreObjectPropertiesSlow(UObject* Obj, FSpudMemoryReader& In,
-	                                 const FSpudClassMetadata& Meta,
-	                                 TSharedPtr<const FSpudClassDef> ClassDef, const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth = 0);
+	void RestoreObjectPropertiesSlow(UObject* Obj, FSpudMemoryReader& In, const FSpudClassMetadata& Meta,
+									 TSharedPtr<const FSpudClassDef> ClassDef, const TArray<uint32>& PropertyOffsets, 
+									 const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth = 0);
 
 	class RestorePropertyVisitor : public SpudPropertyUtil::PropertyVisitor
 	{
 	protected:
 		USpudState* ParentState; // weak but ok since used in scope
 		TSharedPtr<const FSpudClassDef> ClassDef;
+		const TArray<uint32>& PropertyOffsets;
 		const FSpudClassMetadata& Meta;
 		const TMap<FGuid, UObject*>* RuntimeObjects;
 		FSpudMemoryReader& DataIn;
 	public:
-		RestorePropertyVisitor(USpudState* Parent, FSpudMemoryReader& InDataIn, TSharedPtr<const FSpudClassDef> InClassDef, const FSpudClassMetadata& InMeta, const TMap<FGuid, UObject*>* InRuntimeObjects):
-			ParentState(Parent), ClassDef(InClassDef), Meta(InMeta), RuntimeObjects(InRuntimeObjects), DataIn(InDataIn) {}
+		RestorePropertyVisitor(USpudState* Parent, FSpudMemoryReader& InDataIn, TSharedPtr<const FSpudClassDef> InClassDef, const TArray<uint32>& InPropertyOffsets,
+							   const FSpudClassMetadata& InMeta, const TMap<FGuid, UObject*>* InRuntimeObjects):
+			ParentState(Parent), ClassDef(InClassDef), PropertyOffsets(InPropertyOffsets), Meta(InMeta), RuntimeObjects(InRuntimeObjects), DataIn(InDataIn) {}
 
 		virtual uint32 GetNestedPrefix(FProperty* Prop, uint32 CurrentPrefixID) override;
 		virtual void RestoreNestedUObjectIfNeeded(UObject* RootObject, FProperty* Property, uint32 CurrentPrefixID, void* ContainerPtr, int Depth);
@@ -169,9 +171,9 @@ protected:
 		TArray<FSpudPropertyDef>::TConstIterator StoredPropertyIterator;
 	public:
 		RestoreFastPropertyVisitor(USpudState* Parent, const TArray<FSpudPropertyDef>::TConstIterator& InStoredPropertyIterator,
-		                           FSpudMemoryReader& InDataIn, TSharedPtr<const FSpudClassDef> InClassDef,
+		                           FSpudMemoryReader& InDataIn, TSharedPtr<const FSpudClassDef> InClassDef, const TArray<uint32>& InPropertyOffsets,
 		                           const FSpudClassMetadata& InMeta, const TMap<FGuid, UObject*>* InRuntimeObjects)
-			: RestorePropertyVisitor(Parent, InDataIn, InClassDef, InMeta, InRuntimeObjects),
+			: RestorePropertyVisitor(Parent, InDataIn, InClassDef, InPropertyOffsets, InMeta, InRuntimeObjects),
 			  StoredPropertyIterator(InStoredPropertyIterator)
 		{
 		}
@@ -184,8 +186,9 @@ protected:
 	class RestoreSlowPropertyVisitor : public RestorePropertyVisitor
 	{
 	public:
-		RestoreSlowPropertyVisitor(USpudState* Parent, FSpudMemoryReader& InDataIn, TSharedPtr<const FSpudClassDef> InClassDef, const FSpudClassMetadata& InMeta, const TMap<FGuid, UObject*>* InRuntimeObjects)
-			: RestorePropertyVisitor(Parent, InDataIn, InClassDef, InMeta, InRuntimeObjects) {}
+		RestoreSlowPropertyVisitor(USpudState* Parent, FSpudMemoryReader& InDataIn, TSharedPtr<const FSpudClassDef> InClassDef, const TArray<uint32>& InPropertyOffsets,
+								   const FSpudClassMetadata& InMeta, const TMap<FGuid, UObject*>* InRuntimeObjects)
+			: RestorePropertyVisitor(Parent, InDataIn, InClassDef, InPropertyOffsets, InMeta, InRuntimeObjects) {}
 
 		virtual bool VisitProperty(UObject* RootObject, FProperty* Property, uint32 CurrentPrefixID,
 		                           void* ContainerPtr, int Depth) override;
@@ -203,6 +206,7 @@ protected:
 
 public:
 
+	static FString GetLevelName(const UWorldPartitionRuntimeCell* Cell);
 	static FString GetLevelName(const FString& PackageName);
 	static FString GetLevelName(const ULevel* Level);
 	static FString GetLevelNameForActor(const AActor* Actor);
@@ -308,39 +312,39 @@ public:
 	bool IsLevelDataLoaded(const FString& LevelName);
 
 	/// Clear the state for a given level (does not reset a loaded level, just deletes saved state)
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void ClearLevel(const FString& LevelName);
 
 	/// Get the source of this state (e.g. save file), if any;
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	const FString& GetSource() const { return Source; }
 
 	/// Get the title associated with this save state 
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	const FText& GetTitle() const { return SaveData.Info.Title; }
 	/// Set the title associated with this save state 
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void SetTitle(const FText& Title) {SaveData.Info.Title = Title; }
 	/// Extra information to be stored in the save header that can be read when listing saves (before loading)
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void SetCustomSaveInfo(const USpudCustomSaveInfo* ExtraInfo);
 
 	/// Get the timestamp for when this save state was created
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     const FDateTime& GetTimestamp() const { return SaveData.Info.Timestamp; }
 	/// Set the timestamp for when this save state was created
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void SetTimestamp(const FDateTime& Timestamp) {SaveData.Info.Timestamp = Timestamp; }
 
 	/// Set the screenshot data for this save		
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void SetScreenshot(TArray<uint8>& ImgData);
 
 
 	/// Rename a class in this save data
 	/// This is for performing upgrades on save games that would otherwise be broken
 	/// Returns whether any changes were made
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool RenameClass(const FString& OldClassName, const FString& NewClassName);
 	
 	/// Rename a property on a class in this save data
@@ -348,24 +352,24 @@ public:
 	/// OldPrefix & NewPrefix are for handling nested structs, format is "StructVarName1/StructVarName2" ofr
 	/// a property which is inside variable named StructVarName1 on the class, and then inside StructVarName2 inside that
 	/// Returns whether any changes were made
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool RenameProperty(const FString& ClassName, const FString& OldPropertyName, const FString& NewPropertyName, const FString& OldPrefix, const
                         FString& NewPrefix);
 
 	/// Rename a global object so that it can be correctly found on load
 	/// This is for performing upgrades on save games that would otherwise be broken
 	/// Returns whether any changes were made
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool RenameGlobalObject(const FString& OldName, const FString& NewName);
 
 	/// Rename a level object so that it can be correctly found on load
 	/// This is for performing upgrades on save games that would otherwise be broken
 	/// Returns whether any changes were made
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool RenameLevelObject(const FString& LevelName, const FString& OldName, const FString& NewName);
 
 	/// Get a list of the levels we have state about
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     TArray<FString> GetLevelNames(bool bLoadedOnly);
 
 	/// Utility method to read *just* the information part of a save game from the start of an archive
@@ -441,51 +445,51 @@ public:
 	// Now a bunch of explicit functions so that Blueprints can do something useful with this
 
 	/// Write a vector
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void WriteVector(const FVector& V) { Write(V); }
 	/**
 	 * @brief Read a vector
 	 * @param OutVector The vector we read if successful
 	 * @return True if the value was read successfully
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadVector(FVector& OutVector) { return Read(OutVector); }
 
 	/// Write a rotator
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteRotator(const FRotator& Rot) { Write(Rot); }
 	/**
 	* @brief Read a rotator
 	* @param OutRotator The rotator we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadRotator(FRotator& OutRotator) { return Read(OutRotator); }
 
 	/// Write a transform
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteTransform(const FTransform& T) { Write(T); }
 	/**
 	* @brief Read a transform
 	* @param OutTransform The transform we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadTransform(FTransform& OutTransform) { return Read(OutTransform); }
 
 	/// Write a quaternion
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteQuaternion(const FQuat& Q) { Write(Q); }
 	/**
 	* @brief Read a quaternion
 	* @param OutQuaternion The quaternion we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadQuaternion(FQuat& OutQuaternion) { return Read(OutQuaternion); }
 
 	/// Write a string
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteString(const FString& S) { Write(S); }
 
 	/**
@@ -493,22 +497,22 @@ public:
 	* @param OutString The string we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadString(FString& OutString) { return Read(OutString); }
 
 	/// Write text
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteText(const FText& S) { Write(S); }
 	/**
 	* @brief Read text
 	* @param OutText The text we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadText(FText& OutText) { return Read(OutText); }
 
 	/// Write a GUID
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void WriteGuid(const FGuid& G) { Write(G); }
 	
 	/**
@@ -516,51 +520,51 @@ public:
 	* @param OutGuid The FGuid we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool ReadGuid(FGuid& OutGuid) { return Read(OutGuid); }
 	
 	/// Write an int
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteInt(int V) { Write(V); }
 	/**
 	* @brief Read an int
 	* @param OutInt The int we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadInt(int& OutInt) { return Read(OutInt); }
 
 	/// Write an int64
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteInt64(int64 V) { Write(V); }
 	/**
 	* @brief Read an int64
 	* @param OutInt64 The int64 we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadInt64(int64& OutInt64) { return Read(OutInt64); }
 
 	/// Write a float
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteFloat(float V) { Write(V); }
 	/**
 	* @brief Read a float
 	* @param OutFloat The float we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadFloat(float& OutFloat) { return Read(OutFloat); }
 
 	/// Write a byte
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void WriteByte(uint8 V) { Write(V); }
 	/**
 	* @brief Read a byte
 	* @param OutByte The byte we read if successful
 	* @return True if the value was read successfully
 	*/
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     bool ReadByte(uint8& OutByte) { return Read(OutByte); }
 
 	/// Access the underlying archive in order to write custom data directly.
@@ -578,14 +582,14 @@ public:
 	 * @param MagicID 4-character string (longer strings will be truncated) identifying this chunk type.
 	 *   You can use the same ID multiple times for sibling chunks if you want, it's a type identifier not an instance
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void BeginWriteChunk(FString MagicID);
 
 	/**
 	 * Finish writing a chunk. You must call this the same number of times as BeginWriteChunk for a given ID
 	 * @param MagicID 4-character string (longer strings will be truncated) identifying this chunk type
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void EndWriteChunk(FString MagicID);
 
 	/**
@@ -600,7 +604,7 @@ public:
 	 *   You can use the same ID multiple times for sibling chunks if you want, it's a type identifier not an instance
 	 * @return True if this chunk was found next in the data stream
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool BeginReadChunk(FString MagicID);
 
 	/**
@@ -609,7 +613,7 @@ public:
 	 * of the chunk.
 	 * @param MagicID 4-character string (longer strings will be truncated) identifying this chunk type
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void EndReadChunk(FString MagicID);
 	
 	/**
@@ -619,7 +623,7 @@ public:
 	 * @param OutMagicID Reference to a string which will contain the 4-character identifier
 	 * @returns True if we managed to read enough data to read something that might be a chunk
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool PeekChunk(FString &OutMagicID);
 	
 	/**
@@ -627,7 +631,7 @@ public:
 	 * @param MagicID 4-character string (longer strings will be truncated) identifying the chunk type
 	 * @returns True if we did indeed skip a chunk
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool SkipChunk(FString MagicID);
 	
 	/**
@@ -635,7 +639,7 @@ public:
 	 * a block of 1..n data.
 	 * @param MagicID 4-character string (longer strings will be truncated) identifying chunk type
 	 */
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool IsStillInChunk(FString MagicID) const;
 
 };

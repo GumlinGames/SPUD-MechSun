@@ -2,11 +2,24 @@
 #include <limits>
 
 #include "EngineUtils.h"
-#include "InstancedStruct.h"
 #include "ISpudObject.h"
-#include "..\Public\SpudMemoryReaderWriter.h"
+#include "SpudMemoryReaderWriter.h"
+#if ENGINE_MAJOR_VERSION==5&&ENGINE_MINOR_VERSION>=5
+#include "StructUtils/InstancedStruct.h"
+#else
+#include "InstancedStruct.h"
+#endif
 
 DEFINE_LOG_CATEGORY(LogSpudProps)
+
+struct FCachedPersistentProperty
+{
+	FProperty* Property = nullptr;
+	FStructProperty* NestedStructProp = nullptr;
+	bool bIsInstancedStruct = false;
+};
+
+static TMap<TPair<const UStruct*, bool>, TArray<FCachedPersistentProperty>> PersistentPropertyCache;
 
 bool SpudPropertyUtil::ShouldPropertyBeIncluded(FProperty* Property, bool IsChildOfSaveGame)
 {
@@ -301,73 +314,94 @@ bool SpudPropertyUtil::VisitPersistentProperties(UObject* RootObject, const UStr
                                                      void* ContainerPtr, bool IsChildOfSaveGame, int Depth,
                                                      PropertyVisitor& Visitor)
 {
-	// NOTE: RootObject and ContainerPtr can be null (when parsing just definitions without instances)
-	for (TFieldIterator<FProperty>PIT(Definition, EFieldIteratorFlags::IncludeSuper); PIT; ++PIT)
+	const auto CacheKey = MakeTuple(Definition, IsChildOfSaveGame);
+	auto CachedList = PersistentPropertyCache.Find(CacheKey);
+
+	if (!CachedList)
 	{
-		FProperty* Property = *PIT;
-
-		if (!ShouldPropertyBeIncluded(Property, IsChildOfSaveGame))
-			continue;
-
-		if (!IsPropertySupported(Property))
+		TArray<FCachedPersistentProperty> NewCache;
+		for (TFieldIterator<FProperty> PIT(Definition, EFieldIteratorFlags::IncludeSuper); PIT; ++PIT)
 		{
-			Visitor.UnsupportedProperty(RootObject, Property, PrefixID, Depth);
-			continue;
+			FProperty* Property = *PIT;
+
+			if (!ShouldPropertyBeIncluded(Property, IsChildOfSaveGame))
+				continue;
+
+			if (!IsPropertySupported(Property))
+			{
+				UE_LOG(LogSpudProps, Error, TEXT("Property %s/%s is marked for save but is an unsupported type, ignoring."),
+					*GetNameSafe(RootObject), *Property->GetName());
+				continue;
+			}
+
+			FCachedPersistentProperty Entry;
+			Entry.Property = Property;
+			Entry.NestedStructProp = nullptr;
+			Entry.bIsInstancedStruct = false;
+
+			if (const auto SProp = CastField<FStructProperty>(Property))
+			{
+				if (!IsBuiltInStructProperty(SProp))
+				{
+					Entry.NestedStructProp = SProp;
+					Entry.bIsInstancedStruct = SProp->Struct->IsChildOf(FInstancedStruct::StaticStruct());
+				}
+			}
+
+			NewCache.Add(Entry);
 		}
 
-		// Visitor can early-out
-		if (!Visitor.VisitProperty(RootObject, Property, PrefixID, ContainerPtr, Depth))
+		CachedList = &PersistentPropertyCache.Add(CacheKey, MoveTemp(NewCache));
+	}
+
+	// Copy to local — recursive calls for nested structs can Add() to the map,
+	// which may rehash and invalidate the CachedList pointer.
+	const auto LocalCache = *CachedList;
+
+	for (const auto& Entry : LocalCache)
+	{
+		if (!Visitor.VisitProperty(RootObject, Entry.Property, PrefixID, ContainerPtr, Depth))
 			return false;
 
-		// Now deal with cascading into nested structs (custom structs, not FVector etc)
-		if (const auto SProp = CastField<FStructProperty>(Property))
+		if (Entry.NestedStructProp)
 		{
-			if (!IsBuiltInStructProperty(SProp))
+			const UScriptStruct* StructDefinition = nullptr;
+			void* StructPtr = nullptr;
+
+			if (Entry.bIsInstancedStruct)
 			{
-				const UScriptStruct* StructDefinition = nullptr;
-				void* StructPtr = nullptr;
+				const auto InstancedStruct = ContainerPtr
+					? Entry.NestedStructProp->ContainerPtrToValuePtr<FInstancedStruct>(ContainerPtr)
+					: nullptr;
 
-				// Check if it's a InstancedStruct
-             	if(SProp->Struct->IsChildOf(FInstancedStruct::StaticStruct()))
-             	{
-             		// If it is, we need to get the actual struct from the property
-             		const FInstancedStruct* InstancedStruct = ContainerPtr ? SProp->ContainerPtrToValuePtr<FInstancedStruct>(ContainerPtr) : nullptr;
+				if (InstancedStruct)
+				{
+					if (!InstancedStruct->IsValid())
+					{
+						continue;
+					}
 
-             		if(InstancedStruct)
-             		{
-             			if(!InstancedStruct->IsValid())
-             			{
-             				// If it's not valid, ignore it
-			 				continue;
-             			}
-
-             			StructDefinition = InstancedStruct->GetScriptStruct();
-			 			StructPtr = (void*)InstancedStruct->GetMemory();
-             		}
-             	}
-                else
-                {
-                	StructDefinition = SProp->Struct;
-                	StructPtr = ContainerPtr ? SProp->ContainerPtrToValuePtr<void>(ContainerPtr) : nullptr;
-                }
-
-				// Everything underneath a custom struct is recorded with a nested prefix
-				const uint32 NewPrefixID = Visitor.GetNestedPrefix(SProp, PrefixID);
-				// Should never have no prefix, if none abort
-				if (NewPrefixID == SPUDDATA_PREFIXID_NONE)
-					continue;
-
-				const int NewDepth = Depth + 1;
-		
-				Visitor.StartNestedStruct(RootObject, SProp, NewPrefixID, NewDepth);
-				if (!VisitPersistentProperties(RootObject, StructDefinition, NewPrefixID, StructPtr, true, NewDepth, Visitor))
-					return false;				
-				Visitor.EndNestedStruct(RootObject, SProp, NewPrefixID, NewDepth);
+					StructDefinition = InstancedStruct->GetScriptStruct();
+					StructPtr = const_cast<uint8*>(InstancedStruct->GetMemory());
+				}
 			}
-		}
+			else
+			{
+				StructDefinition = Entry.NestedStructProp->Struct;
+				StructPtr = ContainerPtr ? Entry.NestedStructProp->ContainerPtrToValuePtr<void>(ContainerPtr) : nullptr;
+			}
 
-		// We no longer cascade into UObjects here, since they are separate types
-		// They will be cascaded into by visitors because whether / how you cascade depends on the runtime instance type (or null)
+			const uint32 NewPrefixID = Visitor.GetNestedPrefix(Entry.NestedStructProp, PrefixID);
+			if (NewPrefixID == SPUDDATA_PREFIXID_NONE)
+				continue;
+
+			const int NewDepth = Depth + 1;
+
+			Visitor.StartNestedStruct(RootObject, Entry.NestedStructProp, NewPrefixID, NewDepth);
+			if (!VisitPersistentProperties(RootObject, StructDefinition, NewPrefixID, StructPtr, true, NewDepth, Visitor))
+				return false;
+			Visitor.EndNestedStruct(RootObject, Entry.NestedStructProp, NewPrefixID, NewDepth);
+		}
 	}
 
 	return true;
@@ -537,6 +571,25 @@ FString SpudPropertyUtil::WriteNestedUObjectPropertyData(FObjectProperty* OProp,
 	return Ret;
 }
 
+FString SpudPropertyUtil::WriteSoftObjectPropertyData(FSoftObjectProperty* SProp,
+												 uint32 PrefixID,
+												 const void* Data,
+												 bool bIsArrayElement,
+												 TSharedPtr<FSpudClassDef> ClassDef,
+												 TArray<uint32>& PropertyOffsets,
+												 FSpudClassMetadata& Meta,
+												 FArchive& Out)
+{
+	if (!bIsArrayElement)
+		RegisterProperty(SProp, PrefixID, ClassDef, PropertyOffsets, Meta, Out);
+
+	const FSoftObjectPtr SoftPtr = SProp->GetPropertyValue(Data);
+	FSoftObjectPath Path = SoftPtr.ToSoftObjectPath();
+	Out << Path;
+
+	return Path.GetAssetPathString();
+}
+
 FString SpudPropertyUtil::WriteSubclassOfPropertyData(FClassProperty* CProp,
                                                       UClass* Class,
                                                       uint32 PrefixID,
@@ -579,6 +632,7 @@ bool SpudPropertyUtil::TryWriteUObjectPropertyData(FProperty* Property,
 	UObject* Obj = nullptr;
 	FObjectProperty* StrongProp = CastField<FObjectProperty>(Property);
 	FWeakObjectProperty* WeakProp = CastField<FWeakObjectProperty>(Property);
+	FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Property);
 	
 	if (StrongProp)
 	{
@@ -589,7 +643,7 @@ bool SpudPropertyUtil::TryWriteUObjectPropertyData(FProperty* Property,
 		Obj = WeakProp->GetObjectPropertyValue(Data);
 	}
 
-	if (StrongProp || WeakProp)
+	if (StrongProp || WeakProp || SoftProp) 
 	{
 		// Nullrefs are OK, but if valid we need to check it's an Actor
 		if (IsActorObjectProperty(Property))
@@ -611,6 +665,11 @@ bool SpudPropertyUtil::TryWriteUObjectPropertyData(FProperty* Property,
 			// non-actor UObject
 			const FString Val = WriteNestedUObjectPropertyData(StrongProp, Obj, PrefixID, Data, bIsArrayElement, ClassDef,
 			                                                   PropertyOffsets, Meta, Out);
+			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Property, Depth), *Val);
+		}
+		else if (SoftProp)
+		{
+			const FString Val = WriteSoftObjectPropertyData(SoftProp, PrefixID, Data, bIsArrayElement, ClassDef, PropertyOffsets, Meta, Out);
 			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Property, Depth), *Val);
 		}
 		return true;
@@ -752,6 +811,20 @@ FString SpudPropertyUtil::ReadNestedUObjectPropertyData(FObjectProperty* OProp,
 	return Ret;
 }
 
+FString SpudPropertyUtil::ReadSoftObjectPropertyData(FSoftObjectProperty* SProp,
+												  void* Data,
+												  const FSpudClassMetadata& Meta,
+												  FArchive& In)
+{
+	FSoftObjectPath Path;
+	In << Path;
+
+	const FSoftObjectPtr SoftObjectPtr(Path);
+	SProp->SetPropertyValue(Data, SoftObjectPtr);
+
+	return SoftObjectPtr.ToString();
+}
+
 FString SpudPropertyUtil::ReadSubclassOfPropertyData(FClassProperty* CProp,
                                                      void* Data,
                                                      const RuntimeObjectMap* RuntimeObjects,
@@ -798,11 +871,10 @@ bool SpudPropertyUtil::TryReadUObjectPropertyData(FProperty* Prop, void* Data,
 {
 	FObjectProperty* StrongProp = CastField<FObjectProperty>(Prop);
 	FWeakObjectProperty* WeakProp = CastField<FWeakObjectProperty>(Prop);
+	FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Prop);
 	
-	
-	if ((StrongProp || WeakProp) && StoredPropertyTypeMatchesRuntime(Prop, StoredProperty, true)) // we ignore array flag since we could be processing inner
+	if ((StrongProp || WeakProp || SoftProp) && StoredPropertyTypeMatchesRuntime(Prop, StoredProperty, true)) // we ignore array flag since we could be processing inner
 	{
-
 		// Nullrefs are OK, but if valid we need to check it's an Actor
 		// Actor refs supports both strong & weak object refs
 		if (IsActorObjectProperty(Prop))
@@ -818,6 +890,11 @@ bool SpudPropertyUtil::TryReadUObjectPropertyData(FProperty* Prop, void* Data,
 		else if (StrongProp) // Only strong refs for nested (owned)
 		{
 			const FString Val = ReadNestedUObjectPropertyData(StrongProp, Data, RuntimeObjects, Level, Outer, Meta, In);
+			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Prop, Depth), *Val);
+		}
+		else if (SoftProp)
+		{
+			const FString Val = ReadSoftObjectPropertyData(SoftProp, Data, Meta, In);
 			UE_LOG(LogSpudProps, Verbose, TEXT("%s = %s"), *GetLogPrefix(Prop, Depth), *Val);
 		}
 		return true;
@@ -1133,16 +1210,13 @@ void SpudPropertyUtil::RestoreContainerProperty(UObject* RootObject, FProperty* 
 	
 }
 
-bool SpudPropertyUtil::StoredClassDefMatchesRuntime(const FSpudClassDef& ClassDef, const FSpudClassMetadata& Meta)
+bool SpudPropertyUtil::StoredClassDefMatchesRuntime(const FSpudClassDef& ClassDef, const UClass* RuntimeClass, const FSpudClassMetadata& Meta)
 {
 	// This implementation needs to iterate / recurse in *exactly* the same way as the Store methods for the same
 	// Class. The visitor pattern ensures that.
 	// We *could* generate a hash of properties to compare stored to runtime, but since we'd have to generate the runtime
 	// hash every time anyway, it's actually quicker to just iterate and fail on the first non-match than calculate an entire hash
 	// We'll cache this result per file load anyway
-	const FSoftClassPath CP(ClassDef.ClassName);
-	const auto RuntimeClass = CP.TryLoadClass<UObject>();
-
 	const auto StoredPropertyIterator = ClassDef.Properties.CreateConstIterator();
 
 	StoredMatchesRuntimePropertyVisitor Visitor(StoredPropertyIterator, ClassDef, Meta);
@@ -1361,5 +1435,3 @@ FString SpudPropertyUtil::GetLogPrefix(const FProperty* Property, int Depth)
 
 	return FString::Printf(TEXT(" |%s %s"), *Prefix, *Property->GetNameCPP());
 }
-
-

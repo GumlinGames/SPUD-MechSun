@@ -1,4 +1,4 @@
-﻿#include "..\Public\SpudMemoryReaderWriter.h"
+﻿#include "SpudMemoryReaderWriter.h"
 #include "UObject/Object.h"
 FArchive& FSpudMemoryWriter::operator<<(UObject*& Obj)
 {
@@ -15,7 +15,11 @@ FArchive& FSpudMemoryReader::operator<<(UObject*& Obj)
 	FString LoadedString;
 	*this << LoadedString;
 	// look up the object by fully qualified pathname
+#if ENGINE_MAJOR_VERSION==5&&ENGINE_MINOR_VERSION>=7
+	Obj = FindObject<UObject>(nullptr, *LoadedString, EFindObjectFlags::None);
+#else
 	Obj = FindObject<UObject>(nullptr, *LoadedString, false);
+#endif
 	// If we couldn't find it, and we want to load it, do that
 	if(!Obj)
 	{

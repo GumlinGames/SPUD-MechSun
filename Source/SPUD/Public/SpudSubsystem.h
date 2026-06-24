@@ -7,6 +7,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Tickable.h"
 #include "Engine/World.h"
+#include "Engine/GameInstance.h"
 #include "Engine/AssetUserData.h"
 
 #include "SpudSubsystem.generated.h"
@@ -48,6 +49,8 @@ enum class ESpudSystemState : uint8
     LoadingGame,
 	/// Currently saving a game, cannot be interrupted
     SavingGame,
+	/// Currently saving a game async, cannot be interrupted
+	SavingGameAsync,
 	/// Starting a new game, after the next level load
 	NewGameOnNextLevel,
 };
@@ -72,7 +75,7 @@ class SPUD_API USpudStreamingLevelWrapper : public UObject
 
 public:
 	UPROPERTY()
-	ULevelStreaming* LevelStreaming;
+	TObjectPtr<ULevelStreaming> LevelStreaming;
 
 	UFUNCTION()
 	void OnLevelShown();
@@ -140,27 +143,34 @@ public:
 
 	/// The time delay after the last request for a streaming level is withdrawn, that the level will be unloaded
 	/// This is used to reduce load/unload thrashing at boundaries
-	UPROPERTY(BlueprintReadWrite, Config)
+	UPROPERTY(BlueprintReadWrite, Config, Category="SPUD")
 	float StreamLevelUnloadDelay = 3;
 
 	/// The desired width of screenshots taken for save games
-	UPROPERTY(BlueprintReadWrite, Config)
+	UPROPERTY(BlueprintReadWrite, Config, Category="SPUD")
 	int32 ScreenshotWidth = 240;
 	/// The desired height of screenshots taken for save games
-	UPROPERTY(BlueprintReadWrite, Config)
+	UPROPERTY(BlueprintReadWrite, Config, Category="SPUD")
 	int32 ScreenshotHeight = 135;
-	FDelegateHandle OnScreenshotHandle;
+
+	/// Maximum number of numbered quick save slots to keep. 0 = single reusable slot (legacy behavior).
+	UPROPERTY(BlueprintReadWrite, Config)
+	int32 MaxQuickSaves = 0;
+
+	/// Maximum number of numbered auto save slots to keep. 0 = single reusable slot (legacy behavior).
+	UPROPERTY(BlueprintReadWrite, Config)
+	int32 MaxAutoSaves = 0;
 
 	/// If true, use the show/hide events of streaming levels to save/load, which is compatible with World Partition
 	/// You can set this to false to change to the legacy mode which requires ASpudStreamingVolume
-	UPROPERTY(BlueprintReadWrite, Config)
+	UPROPERTY(BlueprintReadWrite, Config, Category="SPUD")
 	bool bSupportWorldPartition = true;
 
 	/// Levels with a name that matches any entry in this list will not be saved/loaded
 	/// Useful for excluding e.g. title screen / transition levels.
 	/// Supports basic wildcard matching. Only considers the level name, not the path to the level.
 	/// Case insensitive.
-	UPROPERTY(BlueprintReadWrite, Config)
+	UPROPERTY(BlueprintReadWrite, Config, Category="SPUD")
 	TArray<FString> ExcludeLevelNamePatterns;
 
 protected:
@@ -174,11 +184,17 @@ protected:
 	FCriticalSection LevelsPendingLoadMutex;
 	FCriticalSection LevelsPendingUnloadMutex;
 	FTimerHandle StreamLevelUnloadTimerHandle;
-	float ScreenshotTimeout = 0;	
 	FString SlotNameInProgress;
 	FText TitleInProgress;
 	UPROPERTY()
 	TObjectPtr<const USpudCustomSaveInfo> ExtraInfoInProgress;
+
+	bool bPendingEndGame = false;
+	TOptional<TPair<bool, bool>> PendingNewGameArgs;
+
+	/// Active save-block reasons -> nesting count. While non-empty, all saves are refused inside SaveGame().
+	/// Game-thread only; not a UPROPERTY (no UObject refs, no GC concern). Cleared on map transition / EndGame.
+	TMap<FName, int32> SaveBlockers;
 
 	UPROPERTY()
 	TArray<TWeakObjectPtr<UObject>> GlobalObjects;
@@ -187,15 +203,15 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UWorld> WorldToLoad;
 	
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	ESpudSystemState CurrentState = ESpudSystemState::RunningIdle;
 
 	// True while restoring game state, either by loading a game or restoring the state of a streamed-in level.
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	bool IsRestoringState = false;
 
 	/// True when system shutdown has been started
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(BlueprintReadOnly, Category="SPUD")
 	bool bIsTearingDown = false;
 
 	// The currently active game state
@@ -230,7 +246,7 @@ protected:
 	TMap<FName, FStreamLevelRequests> LevelRequests;
 
 	UPROPERTY()
-	TMap<ULevelStreaming*, USpudStreamingLevelWrapper*> MonitoredStreamingLevels;
+	TMap<TObjectPtr<ULevelStreaming>, TObjectPtr<USpudStreamingLevelWrapper>> MonitoredStreamingLevels;
 
 	bool ServerCheck(bool LogWarning) const;
 
@@ -239,7 +255,7 @@ protected:
 	UFUNCTION()
 	void OnSeamlessTravelTransition(UWorld* World);
 	UFUNCTION()
-	void OnPostLoadMap(UWorld* World);
+	void OnPostLoadMap(UWorld* World, const int32 UserIndex);
 	UFUNCTION()
 	void OnActorDestroyed(AActor* Actor);
 	void SubscribeAllLevelObjectEvents();
@@ -248,26 +264,28 @@ protected:
 	void UnsubscribeAllLevelObjectEvents();
 	
 	// This is a latent callback and has to be BlueprintCallable
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	void PostLoadStreamLevel(int32 LinkID);
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void PostUnloadStreamLevel(int32 LinkID);
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void PostLoadStreamLevelGameThread(FName LevelName);
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void PostUnloadStreamLevelGameThread(FName LevelName);
 
 	void StoreWorld(UWorld* World, bool bReleaseLevels, bool bBlocking);
 	void StoreLevel(ULevel* Level, bool bRelease, bool bBlocking);
 
-	UFUNCTION()
-	void ScreenshotTimedOut();
-	UFUNCTION()
-    void OnScreenshotCaptured(int32 Width, int32 Height, const TArray<FColor>& Colours);
+	void OnScreenshotCaptured(int32 Width, int32 Height, TArray<FColor>&& Colours, const int32 UserIndex);
 
-	void FinishSaveGame(const FString& SlotName, const FText& Title, const USpudCustomSaveInfo* ExtraInfo, TArray<uint8>* ScreenshotData);
-	void LoadComplete(const FString& SlotName, bool bSuccess);
-	void SaveComplete(const FString& SlotName, bool bSuccess);
+	static bool ParseNumberedSlotName(const FString& SlotName, const TCHAR* BaseSlotName, int32& OutNumber);
+	static FString MakeNumberedSlotName(const TCHAR* BaseSlotName, int32 Number);
+	int32 GetHighestSlotNumber(const TCHAR* BaseSlotName, const int32 UserIndex) const;
+	void CleanupOldNumberedSaves(const TCHAR* BaseSlotName, int32 MaxToKeep, int32 LatestNumber, const int32 UserIndex);
+
+	void FinishSaveGame(const FString& SlotName, const int32 UserIndex, const FText& Title, const USpudCustomSaveInfo* ExtraInfo, TArray<uint8>* ScreenshotData);
+	void LoadComplete(const FString& SlotName, const int32 UserIndex, bool bSuccess);
+	void SaveComplete(const FString& SlotName, const int32 UserIndex, bool bSuccess);
 
 	void HandleLevelLoaded(FName LevelName);
 	void HandleLevelLoaded(ULevel* Level) { HandleLevelLoaded(FName(USpudState::GetLevelName(Level))); }
@@ -279,19 +297,47 @@ protected:
 	void CheckStreamUnload();
 	void UnloadStreamLevel(FName LevelName);
 
+	void UpdateRegisteredComps();
+
 public:
 
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
-	UFUNCTION(BlueprintPure)
+	UFUNCTION(BlueprintPure, Category="SPUD")
 	bool IsLoadingGame() const { return CurrentState == ESpudSystemState::LoadingGame; }
 
-	UFUNCTION(BlueprintPure)
-    bool IsSavingGame() const { return CurrentState == ESpudSystemState::SavingGame; }
+	UFUNCTION(BlueprintPure, Category="SPUD")
+    bool IsSavingGame() const { return CurrentState == ESpudSystemState::SavingGame || CurrentState == ESpudSystemState::SavingGameAsync; }
 
-	UFUNCTION(BlueprintPure)
+	UFUNCTION(BlueprintPure, Category="SPUD")
     bool IsIdle() const { return CurrentState == ESpudSystemState::RunningIdle; }
+
+	/**
+	 * Register a reason to block all save operations. Nestable: each AddSaveBlocker(Reason) must be
+	 * balanced by a matching RemoveSaveBlocker(Reason). While any blocker is active, SaveGame() (and
+	 * therefore QuickSaveGame/AutoSaveGame) refuses and broadcasts PostSaveGame(SlotName, false).
+	 * Blockers are cleared automatically on map transition and EndGame, so an actor destroyed before
+	 * it can remove its own blocker cannot permanently disable saving.
+	 * @param Reason Stable key identifying the blocking system (e.g. "Combat", "Cinematic", "Respawn").
+	 */
+	UFUNCTION(BlueprintCallable, Category="SPUD")
+	void AddSaveBlocker(FName Reason);
+
+	/**
+	 * Remove a previously-registered save blocker. Decrements the nesting count for Reason; the reason
+	 * is only cleared once its count reaches zero. Warns if Reason was never registered.
+	 */
+	UFUNCTION(BlueprintCallable, Category="SPUD")
+	void RemoveSaveBlocker(FName Reason);
+
+	/// True if any save blocker is currently active. Saves are refused while this is true.
+	UFUNCTION(BlueprintPure, Category="SPUD")
+	bool IsSaveBlocked() const { return !SaveBlockers.IsEmpty(); }
+
+	/// Returns the set of active save-block reasons (for logging / UI). Counts are not exposed.
+	UFUNCTION(BlueprintPure, Category="SPUD")
+	TArray<FName> GetSaveBlockers() const;
 
 	
 	/**
@@ -301,12 +347,12 @@ public:
 	 *   in a level which has persistent state that you don't want to keep. You MUST load a level after setting this option,
 	 *   even if it's the same level you're currently on.
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
     void NewGame(bool bCheckServerOnly = true, bool bAfterLevelLoad = false);
 
 	/// Terminate a running game. Does not save state. Call this when returning to a main menu for example.
 	/// All map changes after this are ignored by the persistence system
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void EndGame();
 
 	/** Trigger an autosave of the game; this one will register as the latest save, but will NOT count as a Quick Save
@@ -315,36 +361,41 @@ public:
 	* @param bTakeScreenshot If true, the save will include a screenshot, the dimensions of which are
 	* set by the ScreenshotWidth/ScreenshotHeight properties.
 	* @param ExtraInfo Optional object containing custom fields you want to be available when listing saves
+	* @param bAsync
 	**/
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    void AutoSaveGame(FText Title = FText(), bool bTakeScreenshot = true, const USpudCustomSaveInfo* ExtraInfo = nullptr);
+
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    void AutoSaveGame(FText Title = FText(), bool bTakeScreenshot = true, const USpudCustomSaveInfo* ExtraInfo = nullptr, const int32 UserIndex = 0, bool
+                      bAsync = false);
 	/** Perform a Quick Save of the game in a single re-used slot, in response to a player request
 	 * @param Title Optional title of the save, if blank will be titled "Quick Save"
 	 * @param bTakeScreenshot If true, the save will include a screenshot, the dimensions of which are
 	 * set by the ScreenshotWidth/ScreenshotHeight properties.
 	 * @param ExtraInfo Optional object containing custom fields you want to be available when listing saves
+	 * @param bAsync
 	 **/
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    void QuickSaveGame(FText Title = FText(), bool bTakeScreenshot = true, const USpudCustomSaveInfo* ExtraInfo = nullptr);
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    void QuickSaveGame(FText Title = FText(), bool bTakeScreenshot = true, const USpudCustomSaveInfo* ExtraInfo = nullptr, const int32 UserIndex = 0, bool
+                       bAsync = false);
 	
 	/**
 	 * Quick load the game from the last player-requested Quick Save slot (NOT the last autosave or manual save)
 	 * @param TravelOptions Options string to include in the travel URL e.g. "Listen"
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    void QuickLoadGame(const FString& TravelOptions = FString(TEXT("")));
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    void QuickLoadGame(const FString& TravelOptions = FString(TEXT("")), const int32 UserIndex = 0);
 	
 	/**
 	 * Continue a game from the latest save of any kind - autosave, quick save, manual save. The same as calling LoadGame on the most recent. 
 	 * @param TravelOptions Options string to include in the travel URL e.g. "Listen"
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    void LoadLatestSaveGame(const FString& TravelOptions = FString(TEXT("")));
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    void LoadLatestSaveGame(const FString& TravelOptions = FString(TEXT("")), const int32 UserIndex = 0);
 
 	/// Create a save game descriptor which you can use to store additional descriptive information about a save game.
 	/// Fill the returned object in then pass it to the SaveGame call to have additional info to display on save/load screens
 	/// Could be things like completion percentage, hours played, current quests, character class, character level etc
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	USpudCustomSaveInfo* CreateCustomSaveInfo();
 
 	/**
@@ -355,19 +406,20 @@ public:
 	 * set by the ScreenshotWidth/ScreenshotHeight properties.
 	 * @param ExtraInfo Optional object containing custom fields you want to be available when listing saves
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    void SaveGame(const FString& SlotName, const FText& Title = FText(), bool bTakeScreenshot = true, const USpudCustomSaveInfo* ExtraInfo = nullptr);
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    void SaveGame(const FString& SlotName, const FText& Title = FText(), bool bTakeScreenshot = true, const USpudCustomSaveInfo* ExtraInfo = nullptr, const int32 UserIndex = 0, bool bAsync = false);
+
 	/**
 	 * Load the game in a given slot name. Asynchronous, use the PostLoadGame event to determine when load is complete (and success)
 	 * @param SlotName The slot name of the save to load
 	 * @param TravelOptions Options string to include in the travel URL e.g. "Listen"
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    void LoadGame(const FString& SlotName, const FString& TravelOptions = FString(TEXT("")));
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    void LoadGame(const FString& SlotName, const FString& TravelOptions = FString(TEXT("")), const int32 UserIndex = 0);
 
 	/// Delete the save game in a given slot
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    bool DeleteSave(const FString& SlotName);
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    bool DeleteSave(const FString& SlotName, const int32 UserIndex = 0);
 
 	/**
 	* Add a global object to the list of objects which will have their state saved / loaded
@@ -382,7 +434,7 @@ public:
 	* 
 	* @param Obj The global object to track. This object will have its state saved/loaded.
 	*/
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void AddPersistentGlobalObject(UObject* Obj);
 	
 	/**
@@ -396,14 +448,14 @@ public:
 	* @param Obj The global object to track. This object will have its state saved/loaded.
 	* @param Name The name by which to identify this object in the save file. 
 	*/
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
     void AddPersistentGlobalObjectWithName(UObject* Obj, const FString& Name);
 
 	/**
 	 * Remove an object from tracking so it will no longer be saved or loaded.
 	 * @param Obj The object to remove from tracking
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
     void RemovePersistentGlobalObject(UObject* Obj);
 
 	/**
@@ -414,43 +466,43 @@ public:
 	 * @param LevelName The name of the level to remove state for. This should be the name of the map file with no
 	 * prefix or extension.
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void ClearLevelState(const FString& LevelName);
 
 	/// Make a request that a streaming level is loaded. Won't load if already loaded, but will
 	/// record the request count so that unloading is done when all requests are withdrawn.
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void AddRequestForStreamingLevel(UObject* Requester, FName LevelName, bool BlockingLoad);
 	/// Withdraw a request for a streaming level. Once all requesters have rescinded their requests, the
 	/// streaming level will be considered ready to be unloaded.
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void WithdrawRequestForStreamingLevel(UObject* Requester, FName LevelName);
 
 	/// Get the list of the save games with metadata
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-	TArray<USpudSaveGameInfo*> GetSaveGameList(bool bIncludeQuickSave = true, bool bIncludeAutoSave = true, ESpudSaveSorting Sorting = ESpudSaveSorting::None);
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+	TArray<USpudSaveGameInfo*> GetSaveGameList(bool bIncludeQuickSave = true, bool bIncludeAutoSave = true, ESpudSaveSorting Sorting = ESpudSaveSorting::None, const int32 UserIndex = 0);
 
 	/// Get info about the latest save game
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-	USpudSaveGameInfo* GetLatestSaveGame();
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+	USpudSaveGameInfo* GetLatestSaveGame(const int32 UserIndex = 0);
 
 	/// Get info about the quick save game, may return null if none
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    USpudSaveGameInfo* GetQuickSaveGame();
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    USpudSaveGameInfo* GetQuickSaveGame(const int32 UserIndex = 0);
 
 	/// Get info about the auto save game, may return null if none
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-    USpudSaveGameInfo* GetAutoSaveGame();
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+    USpudSaveGameInfo* GetAutoSaveGame(const int32 UserIndex = 0);
 
 	/// Get information about a specific save game slot
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
-	USpudSaveGameInfo* GetSaveGameInfo(const FString& SlotName);
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
+	USpudSaveGameInfo* GetSaveGameInfo(const FString& SlotName, const int32 UserIndex = 0);
 
 
 	/// By default you're not allowed to interrupt save / load operations and any requests received while another is
 	/// believed to be ongoing is ignored. This method basically overrides this and tells the system to accept
 	/// new requests regardless. This is a last resort that you should never need, but it's here as a safety valve in case of errors.
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
     void ForceReset();
 
 	/// Set the version number recorded with world's data model in all save data written after this.
@@ -474,11 +526,11 @@ public:
 	/// 
 	/// If, when loading some object data, the number in the data is different to this version, then all data for objects
 	/// described by the old version will be fed through a user-defined upgrade hook, to allow you to make manual fixes.
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     void SetUserDataModelVersion(int32 Version);
 
 	/// Gets the current version number of your game's data model (@see SetUserDataModelVersion for more details)
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
     int32 GetUserDataModelVersion() const;
 
 	/**
@@ -503,15 +555,15 @@ public:
 	 * @param LatentInfo Completion callback
 	 */
 	UFUNCTION(BlueprintCallable, meta=(Latent, LatentInfo = "LatentInfo"), Category="SPUD")
-	void UpgradeAllSaveGames(bool bUpgradeEvenIfNoUserDataModelVersionDifferences, FSpudUpgradeSaveDelegate SaveNeedsUpgradingCallback, FLatentActionInfo LatentInfo);
+	void UpgradeAllSaveGames(bool bUpgradeEvenIfNoUserDataModelVersionDifferences, FSpudUpgradeSaveDelegate SaveNeedsUpgradingCallback, FLatentActionInfo LatentInfo, const int32 UserIndex = 0);
 	
 	/// Return whether a named slot is a quick save
 	/// Useful for when parsing through saves to check if something is a manual save or not
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
     bool IsQuickSave(const FString& SlotName);
 	/// Return whether a named slot is a quick save
 	/// Useful for when parsing through saves to check if something is a manual save or not
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
     bool IsAutoSave(const FString& SlotName);
 
 	/**
@@ -520,7 +572,7 @@ public:
 	 * an interface to use other methods of loading streaming levels.
 	 * @param LevelName The level that was loaded.
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void NotifyLevelLoadedExternally(FName LevelName);
 
 	/**
@@ -529,20 +581,28 @@ public:
 	 * an interface to use other methods of unloading streaming levels.
 	 * @param Level The level that was unloaded.
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly)
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="SPUD")
 	void NotifyLevelUnloadedExternally(ULevel* Level);
 
 	/// Return whether a level should be stored / restored
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="SPUD")
 	bool ShouldStoreLevel(const ULevel* Level);
 
+	/// Save render target to save file
+	UFUNCTION(BlueprintCallable, Category="SPUD")
+	void SetRenderTargetData(FString Name, UTextureRenderTarget2D* RenderTarget);
+
+	/// Load render target to a texture
+	UFUNCTION(BlueprintCallable, Category="SPUD")
+	UTexture2D* GetRenderTargetData(FString Name);
+	
 	/// Store actor by cell
 	void StoreActorByCell(AActor* Actor, const FString& CellName);
 
 	static FString GetSaveGameDirectory();
 	static FString GetSaveGameFilePath(const FString& SlotName);
 	// Lists saves: note that this is only the filenames, not the directory
-	static void ListSaveGameFiles(TArray<FString>& OutSaveFileList);
+	static void ListSaveGameFiles(TArray<FString>& OutSaveFileList, const int32 UserIndex = 0);
 	static FString GetActiveGameFolder();
 	static FString GetActiveGameFilePath(const FString& Name);
 

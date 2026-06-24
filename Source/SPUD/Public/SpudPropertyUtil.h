@@ -274,7 +274,7 @@ public:
 	/// sequence of properties in a stored class definition (no saved game class changes since stored).
 	/// If so, we can restore data much more efficiently because we don't have to look anything up on instances, just
 	/// iterate through both sides.
-	static bool StoredClassDefMatchesRuntime(const FSpudClassDef& ClassDef, const FSpudClassMetadata& Meta);
+	static bool StoredClassDefMatchesRuntime(const FSpudClassDef& ClassDef, const UClass* RuntimeClass, const FSpudClassMetadata& Meta);
 
 protected:
 	static bool IsNativelySupportedArrayType(const FArrayProperty* AProp);
@@ -366,6 +366,14 @@ protected:
 	                                              TArray<uint32>& PropertyOffsets,
 	                                              FSpudClassMetadata& Meta,
 	                                              FArchive& Out);
+	static FString WriteSoftObjectPropertyData(FSoftObjectProperty* SProp,
+												 uint32 PrefixID,
+												 const void* Data,
+												 bool bIsArrayElement,
+												 TSharedPtr<FSpudClassDef> ClassDef,
+												 TArray<uint32>& PropertyOffsets,
+												 FSpudClassMetadata& Meta,
+												 FArchive& Out);
 	static FString WriteSubclassOfPropertyData(FClassProperty* CProp,
 	                                           UClass* Class,
 	                                           uint32 PrefixID,
@@ -470,6 +478,10 @@ protected:
 	                                             UObject* Outer,
 	                                             const FSpudClassMetadata& Meta,
 	                                             FArchive& In);
+	static FString ReadSoftObjectPropertyData(FSoftObjectProperty* SProp,
+												  void* Data,
+												  const FSpudClassMetadata& Meta,
+												  FArchive& In);
 	static FString ReadSubclassOfPropertyData(FClassProperty* CProp,
 	                                          void* Data,
 	                                          const RuntimeObjectMap* RuntimeObjects,

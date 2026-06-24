@@ -42,6 +42,10 @@ void PopulateAllTypes(T& Obj)
 	Obj.ActorSubclassArray.Add(AStaticMeshActor::StaticClass());
 	Obj.ActorSubclassArray.Add(APointLight::StaticClass());
 
+	Obj.SoftObjectPtr = TSoftObjectPtr<AStaticMeshActor>(FSoftObjectPath("/Game/StarterContent/Props/SM_Chair.SM_Chair"));
+	Obj.SoftObjectPtrArray.Add(TSoftObjectPtr<AStaticMeshActor>(FSoftObjectPath("/Game/StarterContent/Props/SM_Table.SM_Table")));
+	Obj.SoftObjectPtrArray.Add(TSoftObjectPtr<AStaticMeshActor>(nullptr)); // Empty soft pointer
+
 	UTestNestedUObject* Nested1 = NewObject<UTestNestedUObject>();
 	Nested1->NestedStringVal = "Something";
 	Nested1->NestedIntVal = 23;
@@ -147,8 +151,8 @@ void CheckMap(FAutomationTestBase* Test, const FString& Prefix, const TMap<K, V>
 	
 }
 
-template<typename T>
-void CheckAllTypes(FAutomationTestBase* Test, const FString& Prefix, const T& Actual, const T& Expected)
+template<typename T1, typename T2>
+void CheckAllTypes(FAutomationTestBase* Test, const FString& Prefix, const T1& Actual, const T2& Expected)
 {
 	Test->TestEqual(Prefix + "IntVal should match", Actual.IntVal, Expected.IntVal);
 	Test->TestEqual(Prefix + "UInt8Val should match", Actual.UInt8Val, Expected.UInt8Val);
@@ -198,6 +202,13 @@ void CheckAllTypes(FAutomationTestBase* Test, const FString& Prefix, const T& Ac
 	{
 		Test->TestEqual(Prefix + "SubclassOf array 0 should match", Actual.ActorSubclassArray[0].Get(), AStaticMeshActor::StaticClass());
 		Test->TestEqual(Prefix + "SubclassOf array 1 should match", Actual.ActorSubclassArray[1].Get(), APointLight::StaticClass());
+	}
+
+	Test->TestEqual(Prefix + "SoftObjectPtr should match", Actual.SoftObjectPtr.ToSoftObjectPath(), Expected.SoftObjectPtr.ToSoftObjectPath());
+	if (Test->TestEqual(Prefix + "SoftObjectPtr array should be correct size", Actual.SoftObjectPtrArray.Num(), Expected.SoftObjectPtrArray.Num()))
+	{
+		Test->TestEqual(Prefix + "SoftObjectPtr array 0 should match", Actual.SoftObjectPtrArray[0].ToSoftObjectPath(), Expected.SoftObjectPtrArray[0].ToSoftObjectPath());
+		Test->TestEqual(Prefix + "SoftObjectPtr array 1 should match", Actual.SoftObjectPtrArray[1].ToSoftObjectPath(), Expected.SoftObjectPtrArray[1].ToSoftObjectPath());
 	}
 
 	CheckMap(Test, Prefix + "UObjectMap|", Actual.UObjectMap, Expected.UObjectMap);
@@ -483,6 +494,51 @@ bool FTestNonNative::RunTest(const FString& Parameters)
 
 		
 	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTestRenamedClass, "SPUDTest.RenamedClass",
+	EAutomationTestFlags::EditorContext |
+	EAutomationTestFlags::ClientContext |
+	EAutomationTestFlags::ProductFilter)
+
+bool FTestRenamedClass::RunTest(const FString& Parameters)
+{
+	auto SavedObj = NewObject<UTestSaveObjectBasic>();
+	PopulateAllTypes(*SavedObj);
+
+	auto State = NewObject<USpudState>();
+	State->StoreGlobalObject(SavedObj, "TestObject");
+
+	// Renaming the class should not cause slow path restore
+	State->bTestRequireFastPath = true;
+	
+	auto LoadedObj = NewObject<UTestSaveObjectRenamedClass>();
+	State->RestoreGlobalObject(LoadedObj, "TestObject");
+
+	CheckAllTypes(this, "RenamedClass|", *LoadedObj, *SavedObj);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTestSlowPath_DifferentPropertyOrder, "SPUDTest.SlowPath_DifferentPropertyOrder",
+	EAutomationTestFlags::EditorContext |
+	EAutomationTestFlags::ClientContext |
+	EAutomationTestFlags::ProductFilter)
+
+bool FTestSlowPath_DifferentPropertyOrder::RunTest(const FString& Parameters)
+{
+	auto SavedObj = NewObject<UTestSaveObjectBasic>();
+	PopulateAllTypes(*SavedObj);
+
+	auto State = NewObject<USpudState>();
+	State->StoreGlobalObject(SavedObj, "TestObject");
+	
+	auto LoadedObj = NewObject<UTestSaveObjectSlowPath>();
+	State->RestoreGlobalObject(LoadedObj, "TestObject");
+
+	CheckAllTypes(this, "SlowPath_DifferentPropertyOrder|", *LoadedObj, *SavedObj);
 
 	return true;
 }

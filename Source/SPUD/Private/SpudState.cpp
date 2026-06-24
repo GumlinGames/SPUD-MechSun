@@ -9,8 +9,9 @@
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/MovementComponent.h"
 #include "ImageUtils.h"
-#include "../Public/SpudMemoryReaderWriter.h"
+#include "SpudMemoryReaderWriter.h"
 #include "GameFramework/PlayerState.h"
+#include "WorldPartition/WorldPartitionRuntimeCell.h"
 
 DEFINE_LOG_CATEGORY(LogSpudState)
 
@@ -58,6 +59,12 @@ void USpudState::StoreLevel(ULevel* Level, bool bReleaseAfter, bool bBlocking)
 		{
 			if (SpudPropertyUtil::IsPersistentObject(Actor))
 			{
+				// Skip RoamingActors
+				if (Actor->Implements<USpudRoamingActor>())
+				{
+					continue;
+				}
+        
 				StoreActor(Actor, LevelData);
 			}
 		}
@@ -133,8 +140,14 @@ void USpudState::StorePropertyVisitor::StoreNestedUObjectIfNeeded(UObject* RootO
 					{
 						ISpudObjectCallback::Execute_SpudPreStore(Obj, ParentState);
 					}
+
+					TArray<uint32> ObjectPropertyOffsets;
+					TArray<uint8> ObjectData;
+					FSpudMemoryWriter ObjectOut(ObjectData);
 					const uint32 NewPrefixID = GetNestedPrefix(Property, CurrentPrefixID);
-					ParentState->StoreObjectProperties(Obj, NewPrefixID, PropertyOffsets, Meta, Out, Depth+1);
+					ParentState->StoreObjectProperties(Obj, NewPrefixID, ObjectPropertyOffsets, Meta, ObjectOut, Depth+1);
+					Out << ObjectPropertyOffsets;
+					Out << ObjectData;
 
 					if (IsCallback)
 					{
@@ -284,6 +297,7 @@ FSpudNamedObjectData* USpudState::GetLevelActorData(const AActor* Actor, FSpudSa
 	{
 		Ret = &LevelData->LevelActors.Contents.Add(Name);
 		Ret->Name = Name;
+		Ret->ClassID = LevelData->Metadata.FindOrAddClassIDFromName(SpudPropertyUtil::GetClassName(Actor));
 	}
 	
 	return Ret;
@@ -394,6 +408,7 @@ void USpudState::StoreGlobalObject(UObject* Obj, FSpudNamedObjectData* Data)
 	if (Data)
 	{
 		FSpudClassMetadata& Meta = SaveData.GlobalData.Metadata;
+		Data->ClassID = Meta.FindOrAddClassIDFromName(SpudPropertyUtil::GetClassName(Obj));
 		const bool bIsCallback = Obj->GetClass()->ImplementsInterface(USpudObjectCallback::StaticClass());
 
 		if (Obj->Implements<USpudObject>() && ISpudObject::Execute_ShouldSkip(Obj))
@@ -449,78 +464,131 @@ void USpudState::StoreObjectProperties(UObject* Obj, uint32 PrefixID, TArray<uin
 
 void USpudState::RestoreLevel(UWorld* World, const FString& LevelName)
 {
-	RestoreLoadedWorld(World, true, LevelName);
+	for (auto& Level : World->GetLevels())
+	{
+		// Null levels possible
+		if (IsValid(Level))
+		{
+			if (GetLevelName(Level) == LevelName)
+			{
+				if (ShouldStoreLevel(Level))
+				{
+					RestoreLevel(Level);
+				}
+				return;
+			}
+		}
+	}
 }
 
 void USpudState::RestoreLevel(ULevel* Level)
 {
-	if (!IsValid(Level))
-		return;
+    if (!IsValid(Level))
+        return;
+
+    const FString LevelName = GetLevelName(Level);
+    const auto LevelData = GetLevelData(LevelName, false);
+
+    if (!LevelData.IsValid())
+    {
+        UE_LOG(LogSpudState, Log, TEXT("Skipping restore level %s, no data (this may be fine)"), *LevelName);
+        return;
+    }
 	
-	FString LevelName = GetLevelName(Level);
-	auto LevelData = GetLevelData(LevelName, false);
-
-	if (!LevelData.IsValid())
-	{
-		UE_LOG(LogSpudState, Log, TEXT("Skipping restore level %s, no data (this may be fine)"), *LevelName);
-		return;
-	}
-
 	// Mutex lock the level (load and unload events on streaming can be in loading threads)
-	FScopeLock LevelLock(&LevelData->Mutex);
+    FScopeLock LevelLock(&LevelData->Mutex);
+    UE_LOG(LogSpudState, Verbose, TEXT("RESTORE level %s - Start"), *LevelName);
+
+    TMap<FGuid, UObject*> PersistentObjectsByGuid;
+    TArray<AActor*> LevelActorsToRestore;
+    TArray<AActor*> RoamingActorsToRestore;
+
+    // Collect persistent actors and pre-populate guid map
+    /*
+    Dynamically spawned actors can be retained in a level during streaming,
+    until the level's data is collected by the GC:
+    https://dev.epicgames.com/community/learning/knowledge-base/r6wl/unreal-engine-world-building-guide#wp-limitations
+    
+    This means when a level is reloaded before GC runs, both the old and new instances
+    of a spawned actor can exist simultaneously on the level. To avoid respawning
+    duplicates during RestoreLevel, we pre-populate PersistentObjectsByGuid with
+    already-existing actors. If a SpawnedActor entry has a GUID that's already in the map,
+    we skip respawning it, the existing instance will be restored instead.
+    */
+    for (AActor* Actor : Level->Actors)
+    {
+        if (!Actor) continue;
+        if (!SpudPropertyUtil::IsPersistentObject(Actor)) continue;
+
+        LevelActorsToRestore.Add(Actor);
+
+        const FGuid Guid = SpudPropertyUtil::GetGuidProperty(Actor);
+        if (Guid.IsValid())
+            PersistentObjectsByGuid.Add(Guid, Actor);
+    }
 	
-	UE_LOG(LogSpudState, Verbose, TEXT("RESTORE level %s - Start"), *LevelName);
-	TMap<FGuid, UObject*> RuntimeObjectsByGuid;
-	// Respawn dynamic actors first; they need to exist in order for cross-references in level actors to work
-	for (auto&& SpawnedActor : LevelData->SpawnedActors.Contents)
-	{
-		auto Actor = RespawnActor(SpawnedActor.Value, LevelData->Metadata, Level);
-		if (Actor)
-			RuntimeObjectsByGuid.Add(SpawnedActor.Value.Guid, Actor);
-		// Spawned actors will have been added to Level->Actors, their state will be restored there
-	}
+	// Respawn dynamic actors first so cross-references resolve correctly
+	// Skip if actor already exists on level (e.g. WP cell reloaded before GC collected old actors)
+    for (auto&& SpawnedActor : LevelData->SpawnedActors.Contents)
+    {
+        const FGuid& Guid = SpawnedActor.Value.Guid;
 
-	TMap<FGuid, AActor*> RestoredRuntimeActors;
+    	if (UObject** Existing = PersistentObjectsByGuid.Find(Guid))
+    	{
+#if WITH_EDITOR
+    		if (AActor* ExistingActor = Cast<AActor>(*Existing))
+    		{
+    			if (ExistingActor->Implements<USpudRoamingActor>())
+    			{
+    				UE_LOG(LogSpudState, Warning,
+						TEXT("RESTORE level %s - roaming actor %s already exists, something went wrong"),
+						*LevelName, *ExistingActor->GetName());
+    			}
+    		}
+#endif
+    		continue;
+    	}
 
-	// Restore existing actor state
-	for (auto Actor : Level->Actors)
-	{
-		if (SpudPropertyUtil::IsPersistentObject(Actor))
-		{
-			RestoreActor(Actor, LevelData, &RuntimeObjectsByGuid);
-			auto Guid = SpudPropertyUtil::GetGuidProperty(Actor);
-			if (Guid.IsValid())
-			{
-				if (RuntimeObjectsByGuid.Contains(Guid))
-				{
-					if (const auto DuplicatedActor = RestoredRuntimeActors.Find(Guid))
-					{
-						UE_LOG(LogSpudState, Verbose, TEXT("RESTORE level %s - destroying duplicate runtime actor %s"),
-						       *LevelName, *Guid.ToString(EGuidFormats::DigitsWithHyphens));
+        auto Actor = RespawnActor(SpawnedActor.Value, LevelData->Metadata, Level);
+        if (Actor)
+        {
+            if (Actor->Implements<USpudRoamingActor>())
+                RoamingActorsToRestore.Add(Actor);
+            else
+                LevelActorsToRestore.Add(Actor);
 
-						// sometimes runtime actors are duplicated in the level actors array - for example, when hiding a
-						// world partition cell and immediately showing it; need to remove duplicates in this case
-						(*DuplicatedActor)->Destroy();
-					}
-					else
-					{
-						RestoredRuntimeActors.Emplace(Guid, Actor);
-					}
-				}
-				else
-				{
-					RuntimeObjectsByGuid.Add(Guid, Actor);
-				}
-			}
-		}
-	}
-	// Destroy actors in level but missing from save state
-	for (auto&& DestroyedActor : LevelData->DestroyedActors.Values)
-	{
-		DestroyActor(*DestroyedActor, Level);			
-	}
-	UE_LOG(LogSpudState, Verbose, TEXT("RESTORE level %s - Complete"), *LevelName);
+            PersistentObjectsByGuid.Add(Guid, Actor);
+        }
+    }
 
+    // Restore all non-roaming actors
+    for (AActor* Actor : LevelActorsToRestore)
+    {
+    	//Skip RoamingActors restoration by PersistentLevel
+        if (Actor->Implements<USpudRoamingActor>()) continue;
+
+        RestoreActor(Actor, LevelData, &PersistentObjectsByGuid);
+
+        const FGuid Guid = SpudPropertyUtil::GetGuidProperty(Actor);
+        if (Guid.IsValid() && !PersistentObjectsByGuid.Contains(Guid))
+            PersistentObjectsByGuid.Add(Guid, Actor);
+    }
+
+    // Restore roaming actors
+    for (AActor* Actor : RoamingActorsToRestore)
+    {
+        RestoreActor(Actor, LevelData, &PersistentObjectsByGuid);
+
+        const FGuid Guid = SpudPropertyUtil::GetGuidProperty(Actor);
+        if (Guid.IsValid() && !PersistentObjectsByGuid.Contains(Guid))
+            PersistentObjectsByGuid.Add(Guid, Actor);
+    }
+
+    // Destroy actors missing from save state
+    for (auto&& DestroyedActor : LevelData->DestroyedActors.Values)
+        DestroyActor(*DestroyedActor, Level);
+
+    UE_LOG(LogSpudState, Verbose, TEXT("RESTORE level %s - Complete"), *LevelName);
 }
 
 bool USpudState::PreLoadLevelData(const FString& LevelName)
@@ -561,8 +629,19 @@ AActor* USpudState::RespawnActor(const FSpudSpawnedActorData& SpawnedActor,
 		UE_LOG(LogSpudState, Error, TEXT("Cannot respawn instance of %s, class not found"), *ClassName);
 		return nullptr;
 	}
+	
+	
 	FActorSpawnParameters Params;
-	Params.OverrideLevel = Level;
+	
+	if (Class->ImplementsInterface(USpudRoamingActor::StaticClass()))
+	{
+		Params.OverrideLevel = Level->GetWorld()->PersistentLevel;
+	}
+	else
+	{
+		Params.OverrideLevel = Level;
+	}
+	
 	// Need to always spawn since we're not setting position until later
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 	UE_LOG(LogSpudState, Verbose, TEXT(" * Respawning actor %s of type %s"), *SpawnedActor.Guid.ToString(EGuidFormats::DigitsWithHyphens), *ClassName);
@@ -672,7 +751,8 @@ void USpudState::RestoreActor(AActor* Actor, FSpudSaveData::TLevelDataPtr LevelD
 		PreRestoreObject(Actor, LevelData->GetUserDataModelVersion());
 		
 		RestoreCoreActorData(Actor, ActorData->CoreData);
-		RestoreObjectProperties(Actor, ActorData->Properties, LevelData->Metadata, RuntimeObjects);
+		const auto ClassDef = LevelData->Metadata.GetClassDef(ActorData->ClassID);
+		RestoreObjectProperties(Actor, ActorData->Properties, LevelData->Metadata, ClassDef, RuntimeObjects);
 
 		PostRestoreObject(Actor, ActorData->CustomData, LevelData->GetUserDataModelVersion());		
 	}
@@ -801,30 +881,32 @@ void USpudState::RestoreCoreActorData(AActor* Actor, const FSpudCoreActorData& F
 }
 
 void USpudState::RestoreObjectProperties(UObject* Obj, const FSpudPropertyData& FromData, const FSpudClassMetadata& Meta,
-	const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth)
+	TSharedPtr<const FSpudClassDef> StoredClassDef, const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth)
 {
 	FSpudMemoryReader In(FromData.Data);
-	RestoreObjectProperties(Obj, In, Meta, RuntimeObjects, StartDepth);
+	RestoreObjectProperties(Obj, In, Meta, StoredClassDef, FromData.PropertyOffsets, RuntimeObjects, StartDepth);
 
 }
 
 
 void USpudState::RestoreObjectProperties(UObject* Obj, FSpudMemoryReader& In, const FSpudClassMetadata& Meta,
-	const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth)
+										 TSharedPtr<const FSpudClassDef> StoredClassDef, const TArray<uint32>& PropertyOffsets,
+										 const TMap<FGuid, UObject*>* RuntimeObjects, int StartDepth)
 {
-	const auto ClassName = SpudPropertyUtil::GetClassName(Obj);
-	const auto ClassDef = Meta.GetClassDef(ClassName);
-	if (!ClassDef)
+	if (!StoredClassDef)
 	{
-		UE_LOG(LogSpudState, Error, TEXT("Unable to find ClassDef for: %s"), *SpudPropertyUtil::GetClassName(Obj));
+		UE_LOG(LogSpudState, Error, TEXT("Unable to find StoredClassDef for: %s"), *SpudPropertyUtil::GetClassName(Obj));
 		return;
 	}
+	
+	const auto ClassName = SpudPropertyUtil::GetClassName(Obj);
+	const auto ClassDef = Meta.GetClassDef(ClassName);
 
 	// We can use the "fast" path if the stored definition of the class properties exactly matches the runtime order
 	// ClassDef caches the result of this across the context of one loaded file
-	bool bUseFastPath = ClassDef->MatchesRuntimeClass(Meta);	
+	bool bUseFastPath = StoredClassDef->MatchesRuntimeClass(Obj->GetClass(), Meta);
 
-	UE_LOG(LogSpudState, Verbose, TEXT("%s Class: %s"), *SpudPropertyUtil::GetLogPrefix(StartDepth), *ClassDef->ClassName);
+	UE_LOG(LogSpudState, Verbose, TEXT("%s Class: %s"), *SpudPropertyUtil::GetLogPrefix(StartDepth), *StoredClassDef->ClassName);
 
 	if (!bUseFastPath && bTestRequireFastPath)
 	{
@@ -836,21 +918,22 @@ void USpudState::RestoreObjectProperties(UObject* Obj, FSpudMemoryReader& In, co
 	
 	
 	if (bUseFastPath)
-		RestoreObjectPropertiesFast(Obj, In, Meta, ClassDef, RuntimeObjects, StartDepth);
+		RestoreObjectPropertiesFast(Obj, In, Meta, StoredClassDef, PropertyOffsets, RuntimeObjects, StartDepth);
 	else
-		RestoreObjectPropertiesSlow(Obj, In, Meta, ClassDef, RuntimeObjects, StartDepth);
+		RestoreObjectPropertiesSlow(Obj, In, Meta, StoredClassDef, PropertyOffsets, RuntimeObjects, StartDepth);
 }
 
 void USpudState::RestoreObjectPropertiesFast(UObject* Obj, FSpudMemoryReader& In,
                                              const FSpudClassMetadata& Meta,
                                              TSharedPtr<const FSpudClassDef> ClassDef,
+                                             const TArray<uint32>& PropertyOffsets,
                                              const TMap<FGuid, UObject*>* RuntimeObjects,
                                              int StartDepth)
 {
 	UE_LOG(LogSpudState, Verbose, TEXT("%s FAST path, %d properties"), *SpudPropertyUtil::GetLogPrefix(StartDepth), ClassDef->Properties.Num());
 	const auto StoredPropertyIterator = ClassDef->Properties.CreateConstIterator();
 
-	RestoreFastPropertyVisitor Visitor(this, StoredPropertyIterator, In, ClassDef, Meta, RuntimeObjects);
+	RestoreFastPropertyVisitor Visitor(this, StoredPropertyIterator, In, ClassDef, PropertyOffsets, Meta, RuntimeObjects);
 	SpudPropertyUtil::VisitPersistentProperties(Obj, Visitor, StartDepth);
 	
 }
@@ -858,12 +941,13 @@ void USpudState::RestoreObjectPropertiesFast(UObject* Obj, FSpudMemoryReader& In
 void USpudState::RestoreObjectPropertiesSlow(UObject* Obj, FSpudMemoryReader& In,
                                                        const FSpudClassMetadata& Meta,
                                                        TSharedPtr<const FSpudClassDef> ClassDef,
+                                                       const TArray<uint32>& PropertyOffsets,
                                                        const TMap<FGuid, UObject*>* RuntimeObjects,
                                                        int StartDepth)
 {
 	UE_LOG(LogSpudState, Verbose, TEXT("%s SLOW path, %d properties"), *SpudPropertyUtil::GetLogPrefix(StartDepth), ClassDef->Properties.Num());
 
-	RestoreSlowPropertyVisitor Visitor(this, In, ClassDef, Meta, RuntimeObjects);
+	RestoreSlowPropertyVisitor Visitor(this, In, ClassDef, PropertyOffsets, Meta, RuntimeObjects);
 	SpudPropertyUtil::VisitPersistentProperties(Obj, Visitor, StartDepth);
 }
 
@@ -914,8 +998,16 @@ void USpudState::RestorePropertyVisitor::RestoreNestedUObjectIfNeeded(UObject* R
 					{
 						ISpudObjectCallback::Execute_SpudPreRestore(Obj, ParentState);
 					}
+					
+					TArray<uint32> ObjectPropertyOffsets;
+					TArray<uint8> ObjectData;
+					DataIn << ObjectPropertyOffsets;
+					DataIn << ObjectData;
+					
+					FSpudMemoryReader ObjectDataIn(ObjectData);
 					const uint32 NewPrefixID = GetNestedPrefix(Property, CurrentPrefixID);
-					ParentState->RestoreObjectProperties(Obj, DataIn, Meta, RuntimeObjects, Depth+1);
+					const auto StoredClassDef = Meta.GetClassDef(SpudPropertyUtil::GetClassName(Obj));
+					ParentState->RestoreObjectProperties(Obj, ObjectDataIn, Meta, StoredClassDef, ObjectPropertyOffsets, RuntimeObjects, Depth+1);
 
 					if (IsCallback)
 					{
@@ -991,7 +1083,7 @@ bool USpudState::RestoreSlowPropertyVisitor::VisitProperty(UObject* RootObject, 
 		return true;		
 	}
 	auto& StoredProperty = ClassDef->Properties[*PropertyIndexPtr];
-	
+	DataIn.Seek(PropertyOffsets[*PropertyIndexPtr]);
 	SpudPropertyUtil::RestoreProperty(RootObject, Property, ContainerPtr, StoredProperty, RuntimeObjects, Meta, Depth, DataIn);
 
 	RestoreNestedUObjectIfNeeded(RootObject, Property, CurrentPrefixID, ContainerPtr, Depth);
@@ -1001,30 +1093,15 @@ bool USpudState::RestoreSlowPropertyVisitor::VisitProperty(UObject* RootObject, 
 
 void USpudState::RestoreLoadedWorld(UWorld* World)
 {
-	RestoreLoadedWorld(World, false);
-}
+	//When restoring the world, we should only restore the PersistentLevel
+	//remaining levels will then be loaded and restored through streaming from the "streaming source", which is typically the player
+	
+	ULevel* PersistentLevel = World->PersistentLevel;
 
-void USpudState::RestoreLoadedWorld(UWorld* World, bool bSingleLevel, const FString& OnlyLevel)
-{
-	// So that we don't need to check every instance of a class for matching stored / runtime class properties
-	// we will keep a cache of whether to use the fast or slow path. It's only valid for this specific load
-	// because we may load level data or different ages
-	for (auto& Level : World->GetLevels())
+	if (IsValid(PersistentLevel) && ShouldStoreLevel(PersistentLevel))
 	{
-		// Null levels possible
-		if (!IsValid(Level))
-			continue;
-
-		if (bSingleLevel && GetLevelName(Level) != OnlyLevel)
-			continue;
-
-		if (!ShouldStoreLevel(Level))
-			continue;
-
-		RestoreLevel(Level);
-		
+		RestoreLevel(PersistentLevel);
 	}
-
 }
 
 void USpudState::RestoreGlobalObject(UObject* Obj)
@@ -1043,8 +1120,9 @@ void USpudState::RestoreGlobalObject(UObject* Obj, const FSpudNamedObjectData* D
 	{
 		UE_LOG(LogSpudState, Verbose, TEXT("* RESTORE Global Object %s"), *Data->Name)
 		PreRestoreObject(Obj, SaveData.GlobalData.GetUserDataModelVersion());
-		
-		RestoreObjectProperties(Obj, Data->Properties, SaveData.GlobalData.Metadata, nullptr);
+
+		const auto StoredClassDef = SaveData.GlobalData.Metadata.GetClassDef(Data->ClassID);
+		RestoreObjectProperties(Obj, Data->Properties, SaveData.GlobalData.Metadata, StoredClassDef, nullptr);
 
 		PostRestoreObject(Obj, Data->CustomData, SaveData.GlobalData.GetUserDataModelVersion());
 	}
@@ -1390,6 +1468,22 @@ bool USpudState::ShouldStoreLevel(ULevel* Level) const
 	return true;
 }
 
+FString USpudState::GetLevelName(const UWorldPartitionRuntimeCell* Cell)
+{
+	if (!Cell)
+		return "";
+
+	FString LevelName = Cell->GetName();
+	//For builds, cell name will already match what SPUD uses for WP streaming processing
+#if WITH_EDITOR
+	LevelName = Cell->GetWorld()->GetMapName() + "_" + LevelName;
+	// Strip off PIE prefix, "UEDPIE_N_" where N is a number
+	if (LevelName.StartsWith("UEDPIE_"))
+		LevelName = LevelName.Right(LevelName.Len() - 9);
+#endif
+
+	return LevelName;
+}
 
 void USpudState::SetCustomSaveInfo(const USpudCustomSaveInfo* ExtraInfo)
 {
