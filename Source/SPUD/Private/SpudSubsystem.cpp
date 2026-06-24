@@ -846,9 +846,20 @@ void USpudSubsystem::StoreLevel(ULevel* Level, bool bRelease, bool bBlocking)
 	const FString LevelName = USpudState::GetLevelName(Level);
 
 	/* Modification, Gumlin Games -- expand logic for e.g. level instances, without needing a new AWorldSettings. */
-	if (AWorldSettings* settings = GetWorld()->GetWorldSettings())
+	AWorldSettings* root_settings = [Level]() -> AWorldSettings*
 	{
-		if (USpudLevelDataComponent* data = settings->GetComponentByClass<USpudLevelDataComponent>())
+		if (Level->IsPersistentLevel())
+			return Level->GetWorldSettings();
+
+		if (UWorld* world = Level->GetWorld(); IsValid(world))
+			return world->GetWorldSettings();
+
+		return nullptr;
+	}();
+
+	if (IsValid(root_settings))
+	{
+		if (USpudLevelDataComponent* data = root_settings->GetComponentByClass<USpudLevelDataComponent>())
 		{
 			if ((Level->IsPersistentLevel() == false) && Level->IsInstancedLevel() && (data->bPersistInstances == false))
 				return;
